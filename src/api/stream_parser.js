@@ -3,22 +3,20 @@ import { generateToolCallId } from '../utils/idGenerator.js';
 import { setReasoningSignature, setToolSignature } from '../utils/thoughtSignatureCache.js';
 import { getOriginalToolName } from '../utils/toolNameCache.js';
 
-// 预编译的常量（避免重复创建字符串）
+// 预编译的常量
 const DATA_PREFIX = 'data: ';
 const DATA_PREFIX_LEN = DATA_PREFIX.length;
 
-// 高效的行分割器（零拷贝，避免 split 创建新数组）
-// 使用对象池复用 LineBuffer 实例
+// 高效的行分割器（LineBuffer）
 class LineBuffer {
   constructor() {
     this.buffer = '';
     this.lines = [];
   }
   
-  // 追加数据并返回完整的行
   append(chunk) {
     this.buffer += chunk;
-    this.lines.length = 0; // 重用数组
+    this.lines.length = 0;
     
     let start = 0;
     let end;
@@ -27,7 +25,6 @@ class LineBuffer {
       start = end + 1;
     }
     
-    // 保留未完成的部分
     this.buffer = start < this.buffer.length ? this.buffer.slice(start) : '';
     return this.lines;
   }
@@ -38,7 +35,7 @@ class LineBuffer {
   }
 }
 
-// LineBuffer 对象池
+// 对象池逻辑
 const lineBufferPool = [];
 const getLineBuffer = () => {
   const buffer = lineBufferPool.pop();
@@ -56,7 +53,6 @@ const releaseLineBuffer = (buffer) => {
   }
 };
 
-// toolCall 对象池
 const toolCallPool = [];
 const getToolCallObject = () => toolCallPool.pop() || { id: '', type: 'function', function: { name: '', arguments: '' } };
 const releaseToolCallObject = (obj) => {
@@ -64,14 +60,11 @@ const releaseToolCallObject = (obj) => {
   if (toolCallPool.length < maxSize) toolCallPool.push(obj);
 };
 
-// 注册内存清理回调（供外部统一调用）
 function registerStreamMemoryCleanup() {
   registerMemoryPoolCleanup(toolCallPool, () => memoryManager.getPoolSizes().toolCall);
   registerMemoryPoolCleanup(lineBufferPool, () => memoryManager.getPoolSizes().lineBuffer);
 }
 
-// 转换 functionCall 为 OpenAI 格式（使用对象池）
-// 会尝试将安全工具名还原为原始工具名
 function convertToToolCall(functionCall, sessionId, model) {
   const toolCall = getToolCallObject();
   toolCall.id = functionCall.id || generateToolCallId();
@@ -85,9 +78,10 @@ function convertToToolCall(functionCall, sessionId, model) {
   return toolCall;
 }
 
-// 解析并发送流式响应片段（会修改 state 并触发 callback）
-// 支持 DeepSeek 格式：思维链内容通过 reasoning_content 字段输出
-// 同时透传 thoughtSignature，方便客户端后续复用
+/**
+ * 核心修改区域：解析并双重发送思考内容
+ * 实现了“思维链分离与再处理”逻辑
+ */
 function parseAndEmitStreamChunk(line, state, callback) {
   if (!line.startsWith(DATA_PREFIX)) return;
   
@@ -95,24 +89,67 @@ function parseAndEmitStreamChunk(line, state, callback) {
     const data = JSON.parse(line.slice(DATA_PREFIX_LEN));
     const parts = data.response?.candidates?.[0]?.content?.parts;
     
+    // 初始化状态标记（如果尚未存在）
+    if (typeof state._thinkingActive === 'undefined') {
+      state._thinkingActive = false;
+    }
+
     if (parts) {
       for (const part of parts) {
+        // ==========================================
+        // 1. 处理思考内容 (Thought)
+        // ==========================================
         if (part.thought === true) {
+          // A. 处理签名 (透传逻辑)
           if (part.thoughtSignature) {
             state.reasoningSignature = part.thoughtSignature;
             if (state.sessionId && state.model) {
-              //console.log("服务器传入的签名："+state.reasoningSignature);
               setReasoningSignature(state.sessionId, state.model, part.thoughtSignature);
             }
           }
+
+          // B. 通道一：发送原生 reasoning (供前端特定的思考框使用)
           callback({
             type: 'reasoning',
             reasoning_content: part.text || '',
             thoughtSignature: part.thoughtSignature || state.reasoningSignature || null
           });
-        } else if (part.text !== undefined) {
+
+          // C. 通道二：将思考内容注入到 Content 中 (实现双思维链)
+          // 如果是新的一段思考开始，先发送 <thinking> 标签
+          if (!state._thinkingActive) {
+            callback({ type: 'text', content: '<thinking>\n' });
+            state._thinkingActive = true;
+          }
+          // 同步发送思考文本到正文
+          if (part.text) {
+            callback({ type: 'text', content: part.text });
+          }
+        } 
+        
+        // ==========================================
+        // 2. 处理普通文本 (Text)
+        // ==========================================
+        else if (part.text !== undefined) {
+          // 如果之前处于思考状态，现在转为文本，说明思考结束，闭合标签
+          if (state._thinkingActive) {
+            callback({ type: 'text', content: '\n</thinking>\n\n' });
+            state._thinkingActive = false;
+          }
+          
           callback({ type: 'text', content: part.text });
-        } else if (part.functionCall) {
+        } 
+        
+        // ==========================================
+        // 3. 处理工具调用 (Function Call)
+        // ==========================================
+        else if (part.functionCall) {
+          // 工具调用也会打断思考，需要闭合标签
+          if (state._thinkingActive) {
+            callback({ type: 'text', content: '\n</thinking>\n\n' });
+            state._thinkingActive = false;
+          }
+
           const toolCall = convertToToolCall(part.functionCall, state.sessionId, state.model);
           if (part.thoughtSignature) {
             toolCall.thoughtSignature = part.thoughtSignature;
@@ -125,11 +162,21 @@ function parseAndEmitStreamChunk(line, state, callback) {
       }
     }
     
+    // ==========================================
+    // 4. 处理流结束 (Finish)
+    // ==========================================
     if (data.response?.candidates?.[0]?.finishReason) {
+      // 如果流结束时标签仍未闭合，强制闭合
+      if (state._thinkingActive) {
+        callback({ type: 'text', content: '\n</thinking>\n\n' });
+        state._thinkingActive = false;
+      }
+
       if (state.toolCalls.length > 0) {
         callback({ type: 'tool_calls', tool_calls: state.toolCalls });
         state.toolCalls = [];
       }
+      
       const usage = data.response?.usageMetadata;
       if (usage) {
         callback({
